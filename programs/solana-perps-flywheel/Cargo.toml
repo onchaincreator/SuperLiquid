@@ -1,0 +1,14 @@
+[package]
+name = "solana-perps-flywheel"
+version = "0.1.0"
+edition = "2021"
+
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "solana_perps_flywheel"
+
+
+[dependencies]
+anchor-lang = "0.30.1"
+anchor-spl = { version = "0.30.1", features=["token"] }
