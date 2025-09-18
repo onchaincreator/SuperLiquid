@@ -1,0 +1,520 @@
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+
+// =====================================
+// Perps w/ Profit Flywheel to Pump LP
+// =====================================
+// DISCLAIMER: This is a simplified, unaudited skeleton intended for education and prototyping.
+// Perpetuals engines are complex and risky. You MUST add robust math checks, oracle safeguards,
+// reentrancy guards, fee accounting audits, and fuzz/property tests before mainnet.
+
+declare_id!("Fg1WhEel111111111111111111111111111111111");
+
+// Fixed-point precision (6 decimals)
+const FP: u128 = 1_000_000; // 1e6
+const MAX_LEVERAGE_X: u64 = 40; // hard cap (can be tightened per-market)
+
+// ================
+// Errors & Events
+// ================
+#[error_code]
+pub enum PerpsError {
+    #[msg("Leverage too high")] LeverageTooHigh,
+    #[msg("Insufficient margin")] InsufficientMargin,
+    #[msg("Position would exceed per-market max size")] MaxPositionExceeded,
+    #[msg("Unauthorized")] Unauthorized,
+    #[msg("Math overflow")] MathOverflow,
+    #[msg("Oracle price stale or invalid")] BadOracle,
+}
+
+#[event]
+pub struct PositionOpened {
+    pub user: Pubkey,
+    pub market: Pubkey,
+    pub is_long: bool,
+    pub base_size: u64,
+    pub entry_price_fp: u128,
+}
+
+#[event]
+pub struct PositionClosed {
+    pub user: Pubkey,
+    pub market: Pubkey,
+    pub pnl_fp: i128,
+    pub fees_fp: u128,
+}
+
+#[event]
+pub struct Liquidated {
+    pub user: Pubkey,
+    pub market: Pubkey,
+    pub seized_collateral: u64,
+}
+
+// =============
+// Program State
+// =============
+#[account]
+pub struct Config {
+    pub admin: Pubkey,                   // program admin (can be DAO/governance PDA)
+    pub quote_mint: Pubkey,              // SPL mint used for margin/settlement (e.g., USDC)
+    pub fee_bps: u16,                    // taker fee in basis points (1/100th of a %)
+    pub liq_fee_bps: u16,                // liquidation fee
+    pub fee_destination: Pubkey,         // TOKEN account that receives fees -> set to Pump.fun/Pumpswap LP pool token account
+    pub insurance_vault: Pubkey,         // token account for insurance/residuals
+    pub creator_reward_mint: Pubkey,     // optional: token mint whose creator rewards are siphoned
+    pub creator_reward_bps: u16,         // portion of creator rewards to convert/send to fee_destination
+    pub paused: bool,
+}
+
+impl Config {
+    pub const LEN: usize = 32*6 + 2 + 2 + 1; // rough
+}
+
+#[account]
+pub struct Market {
+    pub symbol: [u8; 12],            // e.g. b"SOL-PERP\0\0\0\0\0"
+    pub base_decimals: u8,
+    pub oracle: Pubkey,              // oracle account address (e.g., Pyth/Switchboard price account)
+    pub amm_base_reserve_fp: u128,   // vAMM base reserve (fixed point)
+    pub amm_quote_reserve_fp: u128,  // vAMM quote reserve (fixed point)
+    pub funding_rate_fp: i128,       // last computed hourly funding rate (fp)
+    pub last_funding_ts: i64,        // unix ts
+    pub skew_k_bps: u32,             // how aggressive vAMM deviates mark from index (risk param)
+    pub max_position_base: u64,      // per-position absolute cap in base units (editable)
+    pub maintenance_margin_bps: u16, // MM requirement
+    pub taker_leverage_cap_x: u16,   // per-market leverage cap (<= MAX_LEVERAGE_X)
+}
+
+#[account]
+pub struct UserPosition {
+    pub owner: Pubkey,
+    pub market: Pubkey,
+    pub is_long: bool,
+    pub base_size: i64,         // signed base exposure; long positive, short negative
+    pub entry_price_fp: u128,   // entry mark
+    pub margin_deposited: u64,  // quote tokens posted
+    pub last_funding_settled: i64,
+}
+
+// ==========
+// Interfaces
+// ==========
+// Minimal oracle trait via CPI-less read; implement adapters client-side or copy price data in via instructions.
+#[account]
+pub struct OraclePrice {
+    pub price_fp: u128, // index price in FP
+    pub last_updated_ts: i64,
+}
+
+// =================
+// Program Entrypoint
+// =================
+#[program]
+pub mod solana_perps_flywheel {
+    use super::*;
+
+    pub fn initialize_config(
+        ctx: Context<InitializeConfig>,
+        fee_bps: u16,
+        liq_fee_bps: u16,
+        creator_reward_bps: u16,
+    ) -> Result<()> {
+        let cfg = &mut ctx.accounts.config;
+        cfg.admin = ctx.accounts.admin.key();
+        cfg.quote_mint = ctx.accounts.quote_mint.key();
+        cfg.fee_bps = fee_bps;
+        cfg.liq_fee_bps = liq_fee_bps;
+        cfg.fee_destination = ctx.accounts.fee_destination.key();
+        cfg.insurance_vault = ctx.accounts.insurance_vault.key();
+        cfg.creator_reward_mint = ctx.accounts.creator_reward_mint.key();
+        cfg.creator_reward_bps = creator_reward_bps;
+        cfg.paused = false;
+        Ok(())
+    }
+
+    pub fn set_fee_destination(ctx: Context<AdminOnly>, new_fee_dest: Pubkey) -> Result<()> {
+        let cfg = &mut ctx.accounts.config;
+        cfg.fee_destination = new_fee_dest; // set this to a Pumpswap LP token account to "flywheel" fees
+        Ok(())
+    }
+
+    pub fn create_market(
+        ctx: Context<CreateMarket>,
+        symbol: [u8; 12],
+        base_decimals: u8,
+        skew_k_bps: u32,
+        max_position_base: u64,
+        maintenance_margin_bps: u16,
+        taker_leverage_cap_x: u16,
+        amm_base_reserve_fp: u128,
+        amm_quote_reserve_fp: u128,
+    ) -> Result<()> {
+        require!(taker_leverage_cap_x as u64 <= MAX_LEVERAGE_X, PerpsError::LeverageTooHigh);
+        let m = &mut ctx.accounts.market;
+        m.symbol = symbol;
+        m.base_decimals = base_decimals;
+        m.oracle = ctx.accounts.oracle.key();
+        m.skew_k_bps = skew_k_bps;
+        m.max_position_base = max_position_base;
+        m.maintenance_margin_bps = maintenance_margin_bps;
+        m.taker_leverage_cap_x = taker_leverage_cap_x;
+        m.amm_base_reserve_fp = amm_base_reserve_fp;
+        m.amm_quote_reserve_fp = amm_quote_reserve_fp;
+        m.funding_rate_fp = 0;
+        m.last_funding_ts = Clock::get()?.unix_timestamp;
+        Ok(())
+    }
+
+    pub fn edit_max_position(ctx: Context<AdminOnlyMarket>, new_max_base: u64) -> Result<()> {
+        ctx.accounts.market.max_position_base = new_max_base;
+        Ok(())
+    }
+
+    // === Trading ===
+    pub fn open_position(
+        ctx: Context<OpenPosition>,
+        is_long: bool,
+        quote_to_spend: u64, // margin * leverage
+        leverage_x: u16,
+    ) -> Result<()> {
+        let cfg = &ctx.accounts.config;
+        require!(!cfg.paused, PerpsError::Unauthorized);
+        require!(leverage_x as u64 <= MAX_LEVERAGE_X, PerpsError::LeverageTooHigh);
+        require!(leverage_x <= ctx.accounts.market.taker_leverage_cap_x, PerpsError::LeverageTooHigh);
+
+        // take user funds (margin = quote_to_spend / leverage)
+        let margin = (quote_to_spend as u128 / leverage_x as u128) as u64;
+        token::transfer(ctx.accounts.transfer_user_to_vault(), margin)?;
+
+        // compute entry price from vAMM mark
+        let price_fp = current_mark_price_fp(&ctx.accounts.market, &ctx.accounts.oracle)?;
+
+        // base size from notional / price
+        let base_size_fp: u128 = (quote_to_spend as u128 * FP) / price_fp; // in base units fp
+        let base_size_units: u64 = (base_size_fp / FP) as u64; // truncated; production should round safely
+        require!(base_size_units <= ctx.accounts.market.max_position_base, PerpsError::MaxPositionExceeded);
+
+        let mut up = &mut ctx.accounts.user_position;
+        up.owner = ctx.accounts.user.key();
+        up.market = ctx.accounts.market.key();
+        up.is_long = is_long;
+        up.base_size = if is_long { base_size_units as i64 } else { -(base_size_units as i64) };
+        up.entry_price_fp = price_fp;
+        up.margin_deposited = margin;
+        up.last_funding_settled = Clock::get()?.unix_timestamp;
+
+        emit!(PositionOpened {
+            user: up.owner,
+            market: up.market,
+            is_long,
+            base_size: base_size_units,
+            entry_price_fp: price_fp,
+        });
+
+        Ok(())
+    }
+
+    pub fn close_position(ctx: Context<ClosePosition>) -> Result<()> {
+        let mark_fp = current_mark_price_fp(&ctx.accounts.market, &ctx.accounts.oracle)?;
+        let up = &mut ctx.accounts.user_position;
+        let signed_base = up.base_size as i128;
+        let entry_fp = up.entry_price_fp as i128;
+        let notional_entry_fp = (signed_base.abs() as i128) * (entry_fp as i128);
+        let notional_exit_fp = (signed_base.abs() as i128) * (mark_fp as i128);
+        let direction = if signed_base >= 0 { 1 } else { -1 };
+        // PnL = direction * (exit - entry) * |base|
+        let pnl_fp: i128 = direction * (notional_exit_fp - notional_entry_fp) / FP as i128;
+
+        // fees
+        let fee_fp: u128 = (notional_exit_fp.unsigned_abs() * (ctx.accounts.config.fee_bps as u128)) / 10_000u128;
+
+        // settle: margin + pnl - fees
+        let mut settle_fp: i128 = up.margin_deposited as i128 * FP as i128 + pnl_fp - fee_fp as i128;
+        if settle_fp < 0 { // insurance covers shortfall to zero
+            settle_fp = 0;
+        }
+        let settle_amt: u64 = (settle_fp as u128 / FP) as u64;
+
+        // pay user
+        token::transfer(ctx.accounts.transfer_vault_to_user(), settle_amt)?;
+
+        // flywheel: send fees to fee_destination (pump/pumpswap LP token account)
+        let fee_amt: u64 = (fee_fp / FP) as u64;
+        token::transfer(ctx.accounts.transfer_vault_to_fee_dest(), fee_amt)?;
+
+        emit!(PositionClosed {
+            user: up.owner,
+            market: up.market,
+            pnl_fp,
+            fees_fp: fee_fp,
+        });
+
+        // reset position
+        up.base_size = 0;
+        up.margin_deposited = 0;
+
+        Ok(())
+    }
+
+    pub fn liquidate(ctx: Context<Liquidate>) -> Result<()> {
+        let m = &ctx.accounts.market;
+        let cfg = &ctx.accounts.config;
+        let mark_fp = current_mark_price_fp(m, &ctx.accounts.oracle)?;
+        let up = &mut ctx.accounts.user_position;
+
+        // compute margin ratio ~ (equity / notional)
+        let notional_fp = (up.base_size.abs() as u128) * mark_fp / FP; // quote
+        let entry_fp = up.entry_price_fp as u128;
+        let pnl_fp = if up.base_size >= 0 {
+            (mark_fp as i128 - entry_fp as i128) * (up.base_size as i128) / FP as i128
+        } else {
+            (entry_fp as i128 - mark_fp as i128) * (-(up.base_size as i128)) / FP as i128
+        };
+        let equity_fp = (up.margin_deposited as i128) * FP as i128 + pnl_fp;
+        let mm_req_fp = (notional_fp as u128 * (m.maintenance_margin_bps as u128)) / 10_000u128;
+
+        if equity_fp < mm_req_fp as i128 {
+            // seize up to margin; pay liquidation fee to fee_destination
+            let liq_fee = ((notional_fp as u128) * (cfg.liq_fee_bps as u128) / 10_000) as u64;
+            let seize = up.margin_deposited.min(liq_fee);
+            token::transfer(ctx.accounts.transfer_vault_to_fee_dest(), seize)?;
+            // remaining margin, if any, returned to user
+            let remaining = up.margin_deposited.saturating_sub(seize);
+            if remaining > 0 { token::transfer(ctx.accounts.transfer_vault_to_user(), remaining)?; }
+            up.base_size = 0;
+            up.margin_deposited = 0;
+            emit!(Liquidated { user: up.owner, market: up.market, seized_collateral: seize });
+        }
+        Ok(())
+    }
+
+    pub fn settle_funding(ctx: Context<SettleFunding>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let m = &mut ctx.accounts.market;
+        if now - m.last_funding_ts < 3600 { return Ok(()); }
+        let index_fp = read_oracle_fp(&ctx.accounts.oracle)?;
+        let mark_fp = current_mark_price_fp(m, &ctx.accounts.oracle)?;
+        // simple funding = (mark - index)/index per hour (fp)
+        let premium_fp = ((mark_fp as i128 - index_fp as i128) * (FP as i128)) / index_fp as i128;
+        m.funding_rate_fp = premium_fp;
+        m.last_funding_ts = now;
+        Ok(())
+    }
+
+    // Optional: pull in creator rewards for a mint and forward a portion to fee_destination
+    pub fn sweep_creator_rewards(ctx: Context<SweepCreatorRewards>, amount: u64) -> Result<()> {
+        let cfg = &ctx.accounts.config;
+        require_keys_eq!(cfg.creator_reward_mint, ctx.accounts.creator_reward_mint.key());
+        // move rewards from source -> fee_destination proportionally
+        token::transfer(ctx.accounts.transfer_rewards_to_fee_dest(), amount * (cfg.creator_reward_bps as u64) / 10_000)?;
+        Ok(())
+    }
+
+    pub fn pause(ctx: Context<AdminOnly>, paused: bool) -> Result<()> {
+        ctx.accounts.config.paused = paused; Ok(())
+    }
+}
+
+// =============
+// Math & Oracles
+// =============
+fn read_oracle_fp(oracle: &Account<OraclePrice>) -> Result<u128> {
+    let now = Clock::get()?.unix_timestamp;
+    require!(now - oracle.last_updated_ts < 120, PerpsError::BadOracle);
+    Ok(oracle.price_fp)
+}
+
+fn current_mark_price_fp(m: &Account<Market>, oracle: &Account<OraclePrice>) -> Result<u128> {
+    // vAMM skew premium: mark = index * (1 + k * skew)
+    let index_fp = read_oracle_fp(oracle)?;
+    let k = m.skew_k_bps as i128; // basis points of skew aggressiveness
+    // compute skew = (quote/base - base/quote) proxy using reserve ratio (simplified)
+    let ratio_fp = (m.amm_quote_reserve_fp as i128 * FP as i128) / m.amm_base_reserve_fp as i128;
+    let skew_term_fp = (k as i128 * (ratio_fp - FP as i128)) / 10_000i128; // scaled by bps
+    let mark_fp = ((index_fp as i128) + ((index_fp as i128 * skew_term_fp) / FP as i128)) as u128;
+    Ok(mark_fp.max(1))
+}
+
+// ==========
+// Contexts
+// ==========
+#[derive(Accounts)]
+pub struct InitializeConfig<'info> {
+    #[account(init, payer = admin, space = 8 + 256)]
+    pub config: Account<'info, Config>,
+    pub quote_mint: Account<'info, Mint>,
+    /// CHECK: SPL token account for fee destination (e.g., Pumpswap LP vault)
+    pub fee_destination: AccountInfo<'info>,
+    pub insurance_vault: Account<'info, TokenAccount>,
+    pub creator_reward_mint: Account<'info, Mint>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AdminOnly<'info> {
+    #[account(mut, has_one = admin)]
+    pub config: Account<'info, Config>,
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CreateMarket<'info> {
+    #[account(mut, has_one = admin)]
+    pub config: Account<'info, Config>,
+    #[account(init, payer = payer, space = 8 + 256)]
+    pub market: Account<'info, Market>,
+    pub oracle: Account<'info, OraclePrice>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AdminOnlyMarket<'info> {
+    pub admin: Signer<'info>,
+    #[account(mut, has_one = oracle)]
+    pub market: Account<'info, Market>,
+    pub oracle: Account<'info, OraclePrice>,
+}
+
+#[derive(Accounts)]
+pub struct OpenPosition<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(mut)]
+    pub config: Account<'info, Config>,
+    #[account(mut)]
+    pub market: Account<'info, Market>,
+    pub oracle: Account<'info, OraclePrice>,
+
+    #[account(init_if_needed, payer = user, space = 8 + 200, seeds=[b"pos", user.key().as_ref(), market.key().as_ref()], bump)]
+    pub user_position: Account<'info, UserPosition>,
+
+    #[account(mut)]
+    pub user_token: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub vault_token: Account<'info, TokenAccount>, // program-owned vault holding quote tokens
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> OpenPosition<'info> {
+    fn transfer_user_to_vault(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let c = CpiContext::new(
+            self.token_program.to_account_info(),
+            Transfer { from: self.user_token.to_account_info(), to: self.vault_token.to_account_info(), authority: self.user.to_account_info() }
+        );
+        c
+    }
+}
+
+#[derive(Accounts)]
+pub struct ClosePosition<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(mut)]
+    pub config: Account<'info, Config>,
+    #[account(mut)]
+    pub market: Account<'info, Market>,
+    pub oracle: Account<'info, OraclePrice>,
+
+    #[account(mut, seeds=[b"pos", user.key().as_ref(), market.key().as_ref()], bump)]
+    pub user_position: Account<'info, UserPosition>,
+
+    #[account(mut)]
+    pub user_token: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub vault_token: Account<'info, TokenAccount>,
+    /// CHECK: SPL token account that receives fees (e.g., Pump/Pumpswap LP)
+    #[account(mut)]
+    pub fee_destination: AccountInfo<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+impl<'info> ClosePosition<'info> {
+    fn transfer_vault_to_user(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        CpiContext::new(
+            self.token_program.to_account_info(),
+            Transfer { from: self.vault_token.to_account_info(), to: self.user_token.to_account_info(), authority: self.config.to_account_info() }
+        )
+    }
+    fn transfer_vault_to_fee_dest(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        CpiContext::new(
+            self.token_program.to_account_info(),
+            Transfer { from: self.vault_token.to_account_info(), to: self.fee_destination.to_account_info(), authority: self.config.to_account_info() }
+        )
+    }
+}
+
+#[derive(Accounts)]
+pub struct Liquidate<'info> {
+    #[account(mut)]
+    pub liquidator: Signer<'info>,
+    #[account(mut)]
+    pub config: Account<'info, Config>,
+    #[account(mut)]
+    pub market: Account<'info, Market>,
+    pub oracle: Account<'info, OraclePrice>,
+
+    #[account(mut, seeds=[b"pos", user_position.owner.as_ref(), market.key().as_ref()], bump)]
+    pub user_position: Account<'info, UserPosition>,
+
+    #[account(mut)]
+    pub user_token: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub vault_token: Account<'info, TokenAccount>,
+    /// CHECK
+    #[account(mut)]
+    pub fee_destination: AccountInfo<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+impl<'info> Liquidate<'info> {
+    fn transfer_vault_to_user(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        CpiContext::new(self.token_program.to_account_info(), Transfer { from: self.vault_token.to_account_info(), to: self.user_token.to_account_info(), authority: self.config.to_account_info() })
+    }
+    fn transfer_vault_to_fee_dest(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        CpiContext::new(self.token_program.to_account_info(), Transfer { from: self.vault_token.to_account_info(), to: self.fee_destination.to_account_info(), authority: self.config.to_account_info() })
+    }
+}
+
+#[derive(Accounts)]
+pub struct SettleFunding<'info> {
+    #[account(mut)]
+    pub market: Account<'info, Market>,
+    pub oracle: Account<'info, OraclePrice>,
+}
+
+#[derive(Accounts)]
+pub struct SweepCreatorRewards<'info> {
+    pub config: Account<'info, Config>,
+    pub creator_reward_mint: Account<'info, Mint>,
+    #[account(mut)]
+    pub creator_reward_source: Account<'info, TokenAccount>,
+    /// CHECK
+    #[account(mut)]
+    pub fee_destination: AccountInfo<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+impl<'info> SweepCreatorRewards<'info> {
+    fn transfer_rewards_to_fee_dest(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        CpiContext::new(self.token_program.to_account_info(), Transfer { from: self.creator_reward_source.to_account_info(), to: self.fee_destination.to_account_info(), authority: self.config.to_account_info() })
+    }
+}
+
+// =====================
+// Notes / Integration
+// =====================
+// 1. Fee flywheel: set Config.fee_destination to the SPL token account owned by the Pump.fun/Pumpswap LP vault
+//    so all taker & liquidation fees flow directly into that pool.
+// 2. Oracles: replace OraclePrice with a real adapter reading Pyth or Switchboard prices + confidence checks.
+// 3. AMM: use a proper vAMM (x*y=k) or inventory-skew model. The current implementation is a placeholder.
+// 4. Risk: add circuit breakers, spread caps, funding clamps, OI caps per side, and insurance fund backstops.
+// 5. Access: markets are permissionless via create_market; edit_max_position is admin-gated per request (can be DAO).
+// 6. Compliance: ensure proper signer/authority model; in production use PDAs for vault authority, not Config directly.
