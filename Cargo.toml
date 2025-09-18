@@ -1,5 +1,5 @@
 [workspace]
 members = [
-"programs/solana-perps-flywheel"
+    "programs/solana-perps-flywheel"
 ]
 resolver = "2"
