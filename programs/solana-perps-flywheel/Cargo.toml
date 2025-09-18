@@ -11,4 +11,4 @@ name = "solana_perps_flywheel"
 
 [dependencies]
 anchor-lang = "0.30.1"
-anchor-spl = { version = "0.30.1", features=["token"] }
+anchor-spl = { version = "0.30.1", features = ["token"] }
