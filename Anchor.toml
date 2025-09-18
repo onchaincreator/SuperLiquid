@@ -1,0 +1,16 @@
+[programs.localnet]
+solana_perps_flywheel = "Fg1WhEel111111111111111111111111111111111"
+
+
+[registry]
+url = "https://anchor.projectserum.com"
+
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+
+[scripts]
+build = "anchor build"
+test = "anchor test"
